@@ -1,0 +1,241 @@
+---
+title: "IPW illustration report"
+author: "Lucas B. de Azevedo"
+date: "2026-06-15"
+output: html_document
+---
+
+# Packages
+```{r installing packages}
+#The installing step is not necessary if you use the renv file, available in
+# the project's repository and copy the complete environment in which the code
+# was executed
+
+install.packages("nhanesA")
+install.packages("tidyverse")
+install.packages("gtsummary")
+install.packages("WeighIt")
+install.packages("cobalt")
+install.packages("sandwich")
+install.packages("lmtest")
+```
+
+# Using nhanesA package to access the database and do the variable selection
+
+## Library
+```{r library for nhanes data}
+library(nhanesA) # You may access package documentation through ??nhanesA
+library(tidyverse) # or ?tidyverse. It does apply for futher packages info
+```
+
+## Obtaining information about selected variables
+```{r nhanes variables}
+nhanesCodebook("DEMO_J",     #Demographic information
+               colname = c(
+                 "SEQN",     #Identification (ID)
+                 "RIAGENDR", #Sex
+                 "RIDAGEYR", #Age
+                 "RIDRETH3" #Ethnicity 
+                 )
+               )
+
+nhanesCodebook("MCQ_J",    #Medical related information
+               colname = c(
+                 "SEQN",   #ID
+                 "MCQ010", #Ever been told you have asthma
+                 "MCQ025", #Age when first had asthma
+                 "MCQ035", #Still have asthma
+                 "MCQ040"  #Had asthma attack in past year
+                 )
+               )
+
+nhanesCodebook("SMQ_J",     #Smoking related questions
+               colname = c(
+                 "SEQN",    #ID
+                 "SMQ020",  #Smoked at least 100 cigarettes in life
+                 "SMQ040"   #Do you now smoke cigarettes?
+                 )
+               )
+
+nhanesCodebook("BMX_J",   #Body measures
+               colname = c(
+                 "SEQN",  #ID
+                 "BMXBMI" #Body Mass Index (BMI)
+                 )
+               )
+```
+
+## Creating objects and merging information
+```{r nhanes data frame}
+demo <- nhanes("DEMO_J") |> 
+  select(SEQN, RIAGENDR, RIDAGEYR, RIDRETH3) #Selecting variables
+
+mcq <- nhanes("MCQ_J") |>
+  select(SEQN, MCQ010, MCQ025, MCQ035, MCQ040)
+
+smq <- nhanes("SMQ_J") |>
+  select(SEQN, SMQ020, SMQ040)
+
+bmx <- nhanes("BMX_J") |>
+  select(SEQN, BMXBMI)
+
+# Merging data frame
+
+df_raw <- demo |> 
+  left_join(mcq, by = "SEQN") |> #Joins variables using a reference
+  left_join(smq, by = "SEQN") |> 
+  left_join(bmx, by = "SEQN")
+```
+
+## Modifying varibles to perform analysis
+```{r nhanes df variables modification}
+df_asm <- df_raw |>
+  filter(MCQ035 == "Yes") |>                          #Active asthma 
+  filter(SMQ040 %in% c("Every day", 
+                        "Some days", 
+                        "Not at all")) |>             
+  mutate(
+    A             = case_when(
+      SMQ040    %in% c("Every day", "Some days")   ~ 1L,  #Current smoker
+      SMQ040      == "Not at all"                  ~ 0L,  
+      TRUE                                         ~ NA_integer_
+    ),
+    Y             = case_when(
+      MCQ040      == "Yes" ~ 1L, #"Asthma attack"
+      MCQ040      == "No"  ~ 0L,
+      TRUE                 ~ NA_integer_
+    ),
+    sex           = factor(RIAGENDR),                 #Transfoming in factors
+    race          = factor(RIDRETH3),
+    age           = RIDAGEYR,
+    bmi           = BMXBMI,
+    infant_asm    = ifelse(MCQ025 <= 12, 1L, 0L) #If asthma with less than 12yr
+  ) |>                                           # = 1, 0 otherwise
+  drop_na(A, Y, sex, race, age, bmi)
+```
+
+## Summarizing
+```{r gtsummary to table creation}
+library(gtsummary)
+
+table_asm <- 
+  df_asm |> 
+  tbl_summary(
+    include = c(
+      sex, age, race, bmi, A
+    ),
+              by = Y,
+              label = list(
+                sex        = "Sex",
+                age        = "Age (years)",
+                race       = "Race",
+                bmi        = "Body Mass Index (kg/m²)",
+                infant_asm = "Asthma before 13 years old",
+                A          = "Current smoking"
+              ),
+              statistic = list(
+                all_continuous()  ~ "{mean} ({sd})", 
+                all_categorical() ~ "{n} ({p}%)"
+                ) 
+              ) |> 
+  add_difference(
+    test = everything() ~ "smd" # Difference by standard mean
+    ) |> 
+  modify_header(
+    label    = "**Variable**",
+    stat_1   = "**No asthma attack**  \nN = 124",
+    stat_2   = "**Asthma attack**  \nN = 108",
+    estimate = "**SMD**"
+    ) |>
+  modify_column_hide(
+    columns = c(
+      conf.low, conf.high
+      )
+    ) 
+  #Hiding IC column that automatically display confidence intervals when
+  #using add_difference()
+
+table_asm
+```
+
+# Inverse Probability Weight (IPW)
+```{r creating weights using WeightIt}
+library(WeightIt)
+
+w_out <- weightit(
+  A ~ sex + age + race + bmi + infant_asm, #Regression formula (PS)
+  data    = df_asm,
+  method  = "glm",
+  estimand = "ATE",
+  stabilize = TRUE #SW(A) - Stabilized Weights
+)
+
+summary(w_out) #Cheking if there is any explosive weights
+
+mean(w_out$weights) #Checking model specification
+```
+
+# Assessing balance applying weights
+```{r assessing balance after IPW}
+library(cobalt)
+library(tidyverse)
+
+bal.tab(w_out,
+        thresholds = c(m = 0.1), #SMD threshold of 0.1
+        un         = TRUE)
+
+#Setting up variable names
+v <- data.frame(old = c("age", "sex_Female", "race_Mexican American", 
+                        "race_Other Hispanic", "race_Non-Hispanic White", 
+                        "race_Non-Hispanic Black", "race_Non-Hispanic Asian", 
+                        "race_Other Race - Including Multi-Racial", "bmi", 
+                        "infant_asm"
+                        ),
+                new = c("Age", "Female", "Mexican American", "Other Hispanic", 
+                        "Non-Hispanic White", "Non-Hispanic Black", 
+                        "Non-Hispanic Asian", "Other", "BMI", 
+                        "Asthma before 13 years old"
+                        )
+                )
+
+love.plot(w_out,
+          thresholds  = c(m = 0.1),
+          colors      = c("#FF0000", "#21908C"),  # viridis colors codes
+          shapes      = c(16, 17),
+          var.order   = "unadjusted",
+          var.names   = v
+          ) 
+```
+
+# Adjusting the Marginal Structured Model (MSM) after confounding balance
+```{r MSM using robust variace}
+library(sandwich)
+library(lmtest)
+
+msm_asma <- glm(
+  Y ~ A,
+  data    = df_asm,
+  family  = binomial(link = "logit"),
+  weights = w_out$weights   
+)
+
+coeftest(msm_asma,
+         vcov = vcovHC(
+           msm_asma, type = "HC3" #Robust variance
+           )
+         )
+
+# Exponenciating to transform coeficients in OR
+exp(coef(msm_asma)["A"])
+
+exp(
+  confint.default(
+  msm_asma,
+  parm = "A",
+  vcov = vcovHC(
+    msm_asma,
+    type = "HC3"
+    )
+  )
+)
+```
